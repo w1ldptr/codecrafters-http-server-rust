@@ -68,7 +68,10 @@ impl BasicHttpServer {
             let (resp, close_con) = match parse_res {
                 ParseResult::Get { close, path } => {
                     let resp = if path == "/" {
-                        Self::response200()
+                        Self::response200(vec![])
+                    } else if path.to_ascii_lowercase().starts_with("/echo") {
+                        let body = path[6..].as_bytes().to_vec();
+                        Self::response200(body)
                     } else {
                         Self::response404()
                     };
@@ -79,7 +82,7 @@ impl BasicHttpServer {
 
             if let Err(err) =
                 stream
-                .write_all(Self::serialize_response(&resp).as_slice())
+                .write_all(Self::serialize_response(resp).as_slice())
                 .await {
                     error!("response write error: {err:?}");
                 }
@@ -131,39 +134,45 @@ impl BasicHttpServer {
         }
     }
 
-    fn response200() -> http::Response<()> {
+    fn response200(body: Vec<u8>) -> http::Response<Vec<u8>> {
         http::response::Builder::new()
             .status(200)
-            .header("Content-length", "0")
-            .body(())
+            .header("Content-length", body.len())
+            .header("Content-type", "text/plain")
+            .body(body)
             .unwrap()
     }
 
-    fn response404() -> http::Response<()> {
+    fn response404() -> http::Response<Vec<u8>> {
         http::response::Builder::new()
             .status(404)
             .header("Content-length", "0")
-            .body(())
+            .body(vec![])
             .unwrap()
     }
 
-    fn serialize_response(resp: &http::Response<()>) -> Vec<u8> {
-        let mut serialized = Vec::new();
+    fn serialize_response<T>(resp: http::Response<T>) -> Vec<u8>
+    where T: Into<Vec<u8>>{
+        let mut serialized: Vec<u8> = Vec::new();
 
         let status_line = format!("HTTP/1.1 {} {}\r\n",
                                   resp.status().as_u16(),
                                   resp.status().canonical_reason().unwrap_or(""));
-        serialized.append(&mut status_line.into_bytes());
+        serialized.append(&mut status_line.into());
 
         for (hname, hval) in resp.headers() {
             serialized.append(&mut format!("{}: {}\r\n",
                                            hname.as_str(),
                                            hval.to_str()
                                            .unwrap())
-                              .into_bytes());
+                              .into());
         }
         serialized.push(b'\r'); serialized.push(b'\n');
 
+        let body = resp.into_body();
+        serialized.append(&mut body.into());
+
+        info!("prepared response {serialized:?}");
         serialized
     }
 }
