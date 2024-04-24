@@ -1,4 +1,4 @@
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{eyre, Result, OptionExt};
 use tracing::*;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11,6 +11,7 @@ pub struct BasicHttpServer {
 enum ParseResult {
     Get {
         close: bool,
+        path: String,
     }
 }
 
@@ -64,16 +65,24 @@ impl BasicHttpServer {
                 }
             };
 
-            let close_con = match parse_res {
-                ParseResult::Get { close } => {
-                    close
+            let (resp, close_con) = match parse_res {
+                ParseResult::Get { close, path } => {
+                    let resp = if path == "/" {
+                        Self::response200()
+                    } else {
+                        Self::response404()
+                    };
+
+                    (resp, close)
                 },
             };
 
-            let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-            if let Err(err) = stream.write_all(resp.as_bytes()).await {
-                error!("response write error: {err:?}");
-            }
+            if let Err(err) =
+                stream
+                .write_all(Self::serialize_response(&resp).as_slice())
+                .await {
+                    error!("response write error: {err:?}");
+                }
 
             if close_con {
                 return;
@@ -95,15 +104,66 @@ impl BasicHttpServer {
             }
         };
 
-        let mut close = false;
-        for header in headers {
-            if header.name.eq_ignore_ascii_case("connection") {
-                close = std::str::from_utf8(header.value)?.eq_ignore_ascii_case("close");
+        match req.method {
+            Some("GET") => {
+                let path = req.path
+                    .ok_or_eyre("missing request method")?
+                    .to_string();
+                let mut close = false;
+                for header in headers {
+                    if header.name.eq_ignore_ascii_case("connection") {
+                        close = std::str::from_utf8(header.value)?
+                            .eq_ignore_ascii_case("close");
+                    }
+                }
+
+                Ok(Some(ParseResult::Get {
+                    close,
+                    path,
+                }))
+            },
+            Some(method) => {
+                Err(eyre!("unsupported request method {method}"))
+            }
+            None => {
+                Err(eyre!("missing request method"))
             }
         }
+    }
 
-        Ok(Some(ParseResult::Get {
-            close,
-        }))
+    fn response200() -> http::Response<()> {
+        http::response::Builder::new()
+            .status(200)
+            .header("Content-length", "0")
+            .body(())
+            .unwrap()
+    }
+
+    fn response404() -> http::Response<()> {
+        http::response::Builder::new()
+            .status(404)
+            .header("Content-length", "0")
+            .body(())
+            .unwrap()
+    }
+
+    fn serialize_response(resp: &http::Response<()>) -> Vec<u8> {
+        let mut serialized = Vec::new();
+
+        let status_line = format!("HTTP/1.1 {} {}\r\n",
+                                  resp.status().as_u16(),
+                                  resp.status().canonical_reason().unwrap_or(""));
+        serialized.append(&mut status_line.into_bytes());
+
+        for (hname, hval) in resp.headers() {
+            serialized.append(&mut format!("{}: {}\r\n",
+                                           hname.as_str(),
+                                           hval.to_str()
+                                           .unwrap())
+                              .into_bytes());
+        }
+        serialized.push(b'\r'); serialized.push(b'\n');
+
+        serialized
     }
 }
