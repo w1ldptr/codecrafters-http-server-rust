@@ -12,6 +12,7 @@ enum ParseResult {
     Get {
         close: bool,
         path: String,
+        ua: Option<String>
     }
 }
 
@@ -66,11 +67,14 @@ impl BasicHttpServer {
             };
 
             let (resp, close_con) = match parse_res {
-                ParseResult::Get { close, path } => {
+                ParseResult::Get { close, path, ua } => {
                     let resp = if path == "/" {
                         Self::response200(vec![])
                     } else if path.to_ascii_lowercase().starts_with("/echo") {
                         let body = path[6..].as_bytes().to_vec();
+                        Self::response200(body)
+                    } else if path.to_ascii_lowercase() == "/user-agent" {
+                        let body = ua.unwrap_or("".to_string()).as_bytes().to_vec();
                         Self::response200(body)
                     } else {
                         Self::response404()
@@ -113,16 +117,20 @@ impl BasicHttpServer {
                     .ok_or_eyre("missing request method")?
                     .to_string();
                 let mut close = false;
+                let mut ua = None;
                 for header in headers {
                     if header.name.eq_ignore_ascii_case("connection") {
                         close = std::str::from_utf8(header.value)?
                             .eq_ignore_ascii_case("close");
+                    } else if header.name.eq_ignore_ascii_case("user-agent") {
+                        ua = Some(std::str::from_utf8(header.value)?.to_owned());
                     }
                 }
 
                 Ok(Some(ParseResult::Get {
                     close,
                     path,
+                    ua,
                 }))
             },
             Some(method) => {
