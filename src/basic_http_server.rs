@@ -2,10 +2,12 @@ use color_eyre::eyre::{eyre, Result, OptionExt};
 use tracing::*;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::fs::File;
 use bytes::BytesMut;
 
 pub struct BasicHttpServer {
     listener: TcpListener,
+    dir: String,
 }
 
 enum ParseResult {
@@ -17,12 +19,14 @@ enum ParseResult {
 }
 
 impl BasicHttpServer {
-    pub async fn new(addr: &str) -> Result<BasicHttpServer> {
+    pub async fn new(addr: &str, dir: &str) -> Result<BasicHttpServer> {
         let listener = TcpListener::bind(addr).await?;
+        let dir = dir.to_owned();
 
-        info!("started server on {addr}");
+        info!("started server on {addr} serving files from {dir}");
         Ok(BasicHttpServer {
             listener,
+            dir,
         })
     }
 
@@ -30,12 +34,12 @@ impl BasicHttpServer {
         loop {
             let (stream, _) = self.listener.accept().await?;
 
-            tokio::task::spawn(Self::handle_request(stream));
+            tokio::task::spawn(Self::handle_request(stream, self.dir.clone()));
         }
     }
 
     #[tracing::instrument]
-    async fn handle_request(mut stream: TcpStream)
+    async fn handle_request(mut stream: TcpStream, dir: String)
     {
         info!("starting request handler");
 
@@ -69,13 +73,24 @@ impl BasicHttpServer {
             let (resp, close_con) = match parse_res {
                 ParseResult::Get { close, path, ua } => {
                     let resp = if path == "/" {
-                        Self::response200(vec![])
+                        Self::response200pt(vec![])
                     } else if path.to_ascii_lowercase().starts_with("/echo") {
                         let body = path[6..].as_bytes().to_vec();
-                        Self::response200(body)
+                        Self::response200pt(body)
                     } else if path.to_ascii_lowercase() == "/user-agent" {
                         let body = ua.unwrap_or("".to_string()).as_bytes().to_vec();
-                        Self::response200(body)
+                        Self::response200pt(body)
+                    } else if path.to_ascii_lowercase().starts_with("/files") {
+                        let contents = Self::read_file(&path[6..], &dir).await;
+                        match contents {
+                            Ok(c) => {
+                                Self::response200bin(c)
+                            }
+                            Err(e) => {
+                                error!("File read error {e}");
+                                Self::response404()
+                            }
+                        }
                     } else {
                         Self::response404()
                     };
@@ -142,13 +157,21 @@ impl BasicHttpServer {
         }
     }
 
-    fn response200(body: Vec<u8>) -> http::Response<Vec<u8>> {
+    fn response200(body: Vec<u8>, cont_type: String) -> http::Response<Vec<u8>> {
         http::response::Builder::new()
             .status(200)
             .header("Content-length", body.len())
-            .header("Content-type", "text/plain")
+            .header("Content-type", cont_type)
             .body(body)
             .unwrap()
+    }
+
+    fn response200pt(body: Vec<u8>) -> http::Response<Vec<u8>> {
+        Self::response200(body, "text/plain".to_string())
+    }
+
+    fn response200bin(body: Vec<u8>) -> http::Response<Vec<u8>> {
+        Self::response200(body, "application/octet-stream".to_string())
     }
 
     fn response404() -> http::Response<Vec<u8>> {
@@ -182,5 +205,12 @@ impl BasicHttpServer {
 
         info!("prepared response {serialized:?}");
         serialized
+    }
+
+    async fn read_file(path: &str, dir: &str) -> Result<Vec<u8>> {
+        let mut file = File::open(format!("{dir}{path}")).await?;
+        let mut contents = vec![];
+        file.read_to_end(&mut contents).await?;
+        Ok(contents)
     }
 }
