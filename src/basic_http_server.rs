@@ -15,6 +15,12 @@ enum ParseResult {
         close: bool,
         path: String,
         ua: Option<String>
+    },
+    Post {
+        close: bool,
+        path: String,
+        body_offset: usize,
+        body_len: usize,
     }
 }
 
@@ -97,6 +103,22 @@ impl BasicHttpServer {
 
                     (resp, close)
                 },
+                ParseResult::Post { close, path, body_offset, body_len } => {
+                    let content_prefix = &buf[body_offset..];
+                    match Self::write_file(&mut stream,
+                                           &path[6..],
+                                           &dir,
+                                           content_prefix,
+                                           body_len).await {
+                        Ok(()) => {
+                            (Self::response201(), close)
+                        }
+                        Err(e) => {
+                            error!("File read error {e}");
+                            return;
+                        }
+                    }
+                }
             };
 
             if let Err(err) =
@@ -116,9 +138,10 @@ impl BasicHttpServer {
     {
         let mut headers = [httparse::EMPTY_HEADER; 16];
         let mut req = httparse::Request::new(&mut headers);
-        match req.parse(buf)? {
-            httparse::Status::Complete(_) => {
+        let body_offset = match req.parse(buf)? {
+            httparse::Status::Complete(offset) => {
                 info!("parsed request: {req:?}");
+                offset
             }
             httparse::Status::Partial => {
                 info!("partial request parse result");
@@ -148,6 +171,28 @@ impl BasicHttpServer {
                     ua,
                 }))
             },
+            Some("POST") => {
+                let path = req.path
+                    .ok_or_eyre("missing request method")?
+                    .to_string();
+                let mut close = false;
+                let mut body_len: usize = 0;
+                for header in headers {
+                    if header.name.eq_ignore_ascii_case("connection") {
+                        close = std::str::from_utf8(header.value)?
+                            .eq_ignore_ascii_case("close");
+                    } else if header.name.eq_ignore_ascii_case("content-length") {
+                        body_len = std::str::from_utf8(header.value)?.parse()?;
+                    }
+                }
+
+                Ok(Some(ParseResult::Post {
+                    close,
+                    path,
+                    body_offset,
+                    body_len,
+                }))
+            },
             Some(method) => {
                 Err(eyre!("unsupported request method {method}"))
             }
@@ -172,6 +217,14 @@ impl BasicHttpServer {
 
     fn response200bin(body: Vec<u8>) -> http::Response<Vec<u8>> {
         Self::response200(body, "application/octet-stream".to_string())
+    }
+
+    fn response201() -> http::Response<Vec<u8>> {
+        http::response::Builder::new()
+            .status(201)
+            .header("Content-length", "0")
+            .body(vec![])
+            .unwrap()
     }
 
     fn response404() -> http::Response<Vec<u8>> {
@@ -212,5 +265,25 @@ impl BasicHttpServer {
         let mut contents = vec![];
         file.read_to_end(&mut contents).await?;
         Ok(contents)
+    }
+
+    async fn write_file(stream: &mut TcpStream,
+                        path: &str,
+                        dir: &str,
+                        content_prefix: &[u8],
+                        content_len: usize) -> Result<()> {
+        let mut file = File::create(format!("{dir}{path}")).await?;
+        file.write_all(content_prefix).await?;
+
+        let mut content_len = content_len - content_prefix.len();
+        while content_len > 0 {
+            let mut content_buf = vec![0u8; std::cmp::min(content_len, 65536)];
+            let n = stream.read(&mut content_buf).await?;
+            file.write_all(&content_buf[..n]).await?;
+
+            content_len -= n;
+        }
+
+        Ok(())
     }
 }
