@@ -10,11 +10,16 @@ pub struct BasicHttpServer {
     dir: String,
 }
 
+enum HttpEncoding {
+    Gzip,
+}
+
 enum ParseResult {
     Get {
         close: bool,
         path: String,
-        ua: Option<String>
+        ua: Option<String>,
+        encoding: Option<HttpEncoding>,
     },
     Post {
         close: bool,
@@ -77,15 +82,15 @@ impl BasicHttpServer {
             };
 
             let (resp, close_con) = match parse_res {
-                ParseResult::Get { close, path, ua } => {
+                ParseResult::Get { close, path, ua, encoding } => {
                     let resp = if path == "/" {
-                        Self::response200pt(vec![])
+                        Self::response200pt(vec![], encoding)
                     } else if path.to_ascii_lowercase().starts_with("/echo") {
                         let body = path[6..].as_bytes().to_vec();
-                        Self::response200pt(body)
+                        Self::response200pt(body, encoding)
                     } else if path.to_ascii_lowercase() == "/user-agent" {
                         let body = ua.unwrap_or("".to_string()).as_bytes().to_vec();
-                        Self::response200pt(body)
+                        Self::response200pt(body, encoding)
                     } else if path.to_ascii_lowercase().starts_with("/files") {
                         let contents = Self::read_file(&path[6..], &dir).await;
                         match contents {
@@ -156,12 +161,15 @@ impl BasicHttpServer {
                     .to_string();
                 let mut close = false;
                 let mut ua = None;
+                let mut encoding = None;
                 for header in headers {
                     if header.name.eq_ignore_ascii_case("connection") {
                         close = std::str::from_utf8(header.value)?
                             .eq_ignore_ascii_case("close");
                     } else if header.name.eq_ignore_ascii_case("user-agent") {
                         ua = Some(std::str::from_utf8(header.value)?.to_owned());
+                    } else if header.name.eq_ignore_ascii_case("accept-encoding") {
+                        encoding = Self::parse_encoding(std::str::from_utf8(header.value)?);
                     }
                 }
 
@@ -169,6 +177,7 @@ impl BasicHttpServer {
                     close,
                     path,
                     ua,
+                    encoding,
                 }))
             },
             Some("POST") => {
@@ -202,21 +211,34 @@ impl BasicHttpServer {
         }
     }
 
-    fn response200(body: Vec<u8>, cont_type: String) -> http::Response<Vec<u8>> {
-        http::response::Builder::new()
-            .status(200)
-            .header("Content-length", body.len())
-            .header("Content-type", cont_type)
-            .body(body)
-            .unwrap()
+    fn parse_encoding(encoding: &str) -> Option<HttpEncoding> {
+        if encoding.to_ascii_lowercase().contains("gzip") {
+            Some(HttpEncoding::Gzip)
+        } else {
+            None
+        }
     }
 
-    fn response200pt(body: Vec<u8>) -> http::Response<Vec<u8>> {
-        Self::response200(body, "text/plain".to_string())
+    fn response200(body: Vec<u8>, cont_type: String, encoding: Option<HttpEncoding>) -> http::Response<Vec<u8>> {
+        let res = http::response::Builder::new()
+            .status(200)
+            .header("Content-length", body.len())
+            .header("Content-type", cont_type);
+        let res = match encoding {
+            Some(HttpEncoding::Gzip) => {
+                res.header("Content-encoding", "gzip")
+            }
+            None => res,
+        };
+        res.body(body).unwrap()
+    }
+
+    fn response200pt(body: Vec<u8>, encoding: Option<HttpEncoding>) -> http::Response<Vec<u8>> {
+        Self::response200(body, "text/plain".to_string(), encoding)
     }
 
     fn response200bin(body: Vec<u8>) -> http::Response<Vec<u8>> {
-        Self::response200(body, "application/octet-stream".to_string())
+        Self::response200(body, "application/octet-stream".to_string(), None)
     }
 
     fn response201() -> http::Response<Vec<u8>> {
